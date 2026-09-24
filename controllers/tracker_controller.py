@@ -12,6 +12,21 @@ class TrackerController:
         self.db_name = db_name
         self.logger = logger
 
+                def fetch_user_borrow_records(self, user_id):
+                            conn = connect(self.db_name)
+                            try:
+                                            return conn.execute(
+                                                                """SELECT br.id, i.item_name, br.student_name, br.student_id,
+                                                                                          br.section, br.course, br.quantity, br.status,
+                                                                                                                    br.borrowed_at, br.returned_at
+                                                                                                                                       FROM borrow_records br JOIN inventory i ON i.id = br.inventory_id
+                                                                                                                                                          WHERE br.user_id = ?
+                                                                                                                                                                             ORDER BY br.borrowed_at DESC""",
+                                                                (user_id,),
+                                            ).fetchall()
+                            finally:
+                                            conn.close()
+
             def fetch_user_reservations(self, user_id):
                         conn = connect(self.db_name)
                         try:
@@ -26,24 +41,8 @@ class TrackerController:
                                         ).fetchall()
                         finally:
                                         conn.close()
-                            
-                def fetch_user_borrow_records(self, user_id):
-                    conn = connect(self.db_name)
-                    try:
-                                    return conn.execute(
-                                                        """SELECT br.id, i.item_name, br.student_name, br.student_id,
-                                                                                  br.section, br.course, br.quantity, br.status,
-                                                                                                            br.borrowed_at, br.returned_at
-                                                                                                                               FROM borrow_records br JOIN inventory i ON i.id = br.inventory_id
-                                                                                                                                                  WHERE br.user_id = ?
-                                                                                                                                                                     ORDER BY br.borrowed_at DESC""",
-                                                        (user_id,),
-                                    ).fetchall()
-                    finally:
-                                    conn.close()
-                        
-            def fetch_all_inventory(self):
-        try:
+
+        
             conn = connect(self.db_name)
             cursor = conn.cursor()
             cursor.execute("SELECT id, item_name, category, quantity, unit_price, availability_status FROM inventory ORDER BY id")
