@@ -12,7 +12,10 @@ from database import init_db
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "campus-inventory-development-key")
-
+    body += """
+        <section class="card"><h2>Borrowing history</h2><table><tr><th>Item</th><th>Student</th><th>Course</th><th>Qty</th><th>Status</th><th>Borrowed</th><th>Returned</th></tr>{% for row in borrow_history %}<tr><td>{{ row[1] }}</td><td>{{ row[2] }}<br>{{ row[3] }}</td><td>{{ row[5] }}</td><td>{{ row[6] }}</td><td>{{ row[7] }}</td><td>{{ row[8] or '-' }}</td><td>{{ row[9] or '-' }}</td></tr>{% else %}<tr><td colspan="7">No borrowing history yet.</td></tr>{% endfor %}</table></section>
+            <section class="card"><h2>Reservation history</h2><table><tr><th>Item</th><th>Student</th><th>Course</th><th>Qty</th><th>Date</th><th>Time</th><th>Status</th></tr>{% for row in reservation_history %}<tr><td>{{ row[1] }}</td><td>{{ row[2] }}<br>{{ row[3] }}</td><td>{{ row[5] }}</td><td>{{ row[6] }}</td><td>{{ row[7] }}</td><td>{{ row[8] }}</td><td>{{ row[9] }}</td></tr>{% else %}<tr><td colspan="7">No reservation history yet.</td></tr>{% endfor %}</table></section>"""
+    return page("User dashboard", body, inventory=inventory, borrow_history=TrackerController().fetch_user_borrow_records(session["user_id"]), reservation_history=TrackerController().fetch_user_reservations(session["user_id"]))
 LAYOUT = """
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }} | Campus Inventory</title><style>
