@@ -147,6 +147,16 @@ class AuthController:
         finally:
             conn.close()
 
+    def submit_password_reset_request(self, username, email, new_password):
+        conn = connect(self.db_name)
+        try:
+            row = conn.execute("SELECT id FROM users WHERE username = ? AND email = ?", (username, email)).fetchone()
+            if not row:
+                return False, "Username and email do not match our records."
+        finally:
+            conn.close()
+        return self.admin_change_password(username, new_password)
+
     def fetch_accounts(self):
         conn = connect(self.db_name)
         try:
