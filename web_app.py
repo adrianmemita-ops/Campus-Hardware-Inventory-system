@@ -1,23 +1,36 @@
 import io
 import csv
+import hashlib
+import hmac
 import os
+import secrets
+import smtplib
+import time
+from email.message import EmailMessage
 from functools import wraps
 
+from dotenv import load_dotenv
 from flask import Flask, flash, redirect, render_template_string, request, send_file, session, url_for
 
 from controllers.auth_controller import AuthController
 from controllers.tracker_controller import TrackerController
 from database import init_db
+from utils.logger import logger
 
+
+load_dotenv()
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "campus-inventory-development-key")
+OTP_EXPIRY_SECONDS = 300
+OTP_RESEND_SECONDS = 30
+OTP_MAX_ATTEMPTS = 5
 
 LAYOUT = """
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }} | Campus Inventory</title><style>
 :root{--forest:#164a35;--green:#2e7d50;--mint:#e8f4ec;--ink:#193528;--line:#d9e8dd;--red:#ad3b3b;--gold:#9a6b00}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:linear-gradient(135deg,#f4faf5,#e8f4ec);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}nav{background:var(--forest);color:white;padding:18px 5vw;display:flex;justify-content:space-between;align-items:center;gap:20px}nav strong{letter-spacing:.08em}nav a{color:white;text-decoration:none;margin-left:16px}main{max-width:1240px;margin:32px auto;padding:0 22px}h1{margin:0 0 8px;font-size:clamp(28px,4vw,46px)}h2{margin-top:0}.muted{color:#63806e}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:24px 0}.card{background:rgba(255,255,255,.94);border:1px solid var(--line);border-radius:8px;padding:20px;box-shadow:0 10px 30px #164a3510}.wide{grid-column:1/-1}.grid>section:nth-of-type(2),.grid>section:nth-of-type(3),.grid>section:nth-of-type(4){grid-column:1/-1}.grid>section:nth-of-type(2){order:8}.grid>section:nth-of-type(4){order:9}.grid>section:nth-of-type(3){order:10}.metric{font-size:30px;font-weight:700;color:var(--forest)}.form-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;align-items:end}label{display:block;font-weight:650;font-size:13px;margin-bottom:5px}input,select{width:100%;padding:10px;border:1px solid #c9ddcf;border-radius:5px;background:white;color:var(--ink)}button,.button{border:0;border-radius:5px;padding:10px 14px;background:var(--green);color:white;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}.danger{background:var(--red)}.gold{background:var(--gold)}.soft{background:var(--mint);color:var(--forest)}.actions{display:flex;gap:7px;flex-wrap:wrap;align-items:end}.flash{padding:12px 15px;background:#fff8dc;border:1px solid #ead99a;border-radius:5px;margin-bottom:15px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--forest);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.pill{display:inline-block;padding:4px 9px;border-radius:99px;background:var(--mint);color:var(--green);font-size:12px;font-weight:700}.auth{max-width:450px;margin:8vh auto}.auth .form-row{margin:14px 0}.auth button{width:100%;margin-top:8px}.inline{display:inline}.section-title{display:flex;justify-content:space-between;gap:16px;align-items:center}.small-form{display:grid;grid-template-columns:1fr auto;gap:7px;margin-top:8px}@media(max-width:800px){.grid,.form-grid{grid-template-columns:1fr}.grid>section:nth-of-type(2),.grid>section:nth-of-type(3),.grid>section:nth-of-type(4){grid-column:auto;order:initial}nav{align-items:flex-start;flex-direction:column}table{display:block;overflow-x:auto;white-space:nowrap}.wide{grid-column:auto}}
-+</style></head><body><nav><strong>CAMPUS INVENTORY</strong><span>{% if session.get('username') %}{{ session.username }} ({{ session.role }}) · <a href="{{ url_for('logout') }}">Log out</a>{% endif %}</span></nav><main>{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}{{ body|safe }}</main></body></html>"""
+</style></head><body><nav><strong>CAMPUS INVENTORY</strong><span>{% if session.get('username') %}{{ session.username }} ({{ session.role }}) Â· <a href="{{ url_for('logout') }}">Log out</a>{% endif %}</span></nav><main>{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}{{ body|safe }}</main></body></html>"""
 
 
 def page(title, body, **context):
@@ -44,6 +57,46 @@ def admin_required(view):
     return wrapped
 
 
+def otp_hash(code):
+    return hmac.new(app.config["SECRET_KEY"].encode("utf-8"), code.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def send_otp(email, code):
+    host = os.environ.get("SMTP_HOST")
+    if not host:
+        if os.environ.get("OTP_DEV_MODE", "0").lower() in {"1", "true", "yes"}:
+            logger.warning("OTP for %s (development mode): %s", email, code)
+            return
+        raise RuntimeError("OTP email delivery is not configured.")
+
+    message = EmailMessage()
+    message["Subject"] = "Your Campus Inventory verification code"
+    message["From"] = os.environ.get("SMTP_FROM", os.environ.get("SMTP_USERNAME", "no-reply@campus-inventory.local"))
+    message["To"] = email
+    message.set_content(f"Your Campus Inventory verification code is {code}. It expires in 5 minutes.")
+    with smtplib.SMTP(host, int(os.environ.get("SMTP_PORT", "587")), timeout=10) as smtp:
+        if os.environ.get("SMTP_USE_TLS", "1").lower() not in {"0", "false", "no"}:
+            smtp.starttls()
+        username = os.environ.get("SMTP_USERNAME")
+        if username:
+            smtp.login(username, os.environ.get("SMTP_PASSWORD", ""))
+        smtp.send_message(message)
+
+
+def send_otp_email(receiver_email, otp, intent):
+    """Compatibility wrapper for the OTP email flow used in the experiment docs."""
+    send_otp(receiver_email, otp)
+    return True
+
+
+def issue_otp(pending):
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    send_otp(pending["email"], code)
+    pending.update(otp_hash=otp_hash(code), otp_expires=time.time() + OTP_EXPIRY_SECONDS, otp_attempts=0, otp_last_sent=time.time())
+    session["otp_pending"] = pending
+    return code
+
+
 @app.route("/", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -51,23 +104,181 @@ def login():
         success, message = AuthController().login_user(form.get("username", "").strip(), form.get("email", "").strip(), form.get("password", ""), form.get("role", "user"))
         if success:
             username = form["username"].strip()
-            session.update(username=username, role=form["role"], user_id=AuthController().get_user_id(username))
-            return redirect(url_for("dashboard"))
-        flash(message)
-    body = """<section class="card auth"><h1>Welcome back.</h1><p class="muted">Sign in to manage campus equipment.</p><form method="post"><div class="form-row"><label>Username</label><input name="username" required></div><div class="form-row"><label>Email</label><input name="email" type="email" required></div><div class="form-row"><label>Password</label><input name="password" type="password" required></div><div class="form-row"><label>Account type</label><select name="role"><option>user</option><option>admin</option></select></div><button>Sign in</button></form><p class="muted">Need an account? <a href="/register">Register here</a>.</p></section>"""
+            pending = {
+                "username": username,
+                "email": form["email"].strip(),
+                "role": form["role"],
+                "user_id": AuthController().get_user_id(username),
+            }
+            try:
+                issue_otp(pending)
+            except (RuntimeError, OSError, ValueError) as exc:
+                logger.error("Unable to send login OTP: %s", exc)
+                flash("Sign-in is temporarily unavailable because OTP delivery is not configured.")
+            else:
+                return redirect(url_for("verify_otp"))
+        else:
+            flash(message)
+    body = """<section class="card auth"><h1>Welcome back.</h1><p class="muted">Sign in to manage campus equipment.</p><form method="post"><div class="form-row"><label>Username</label><input name="username" required></div><div class="form-row"><label>Email</label><input name="email" type="email" required></div><div class="form-row"><label>Password</label><input name="password" type="password" required></div><div class="form-row"><label>Account type</label><select name="role"><option>user</option><option>admin</option></select></div><button>Send verification code</button></form><p class="muted">Need an account? <a href="/register">Register here</a>.</p><p class="muted"><a href="/reset-request">Forgot password?</a></p></section>"""
     return page("Sign in", body)
+
+
+@app.route("/verify-otp", defaults={"action": "login"}, methods=["GET", "POST"])
+@app.route("/verify-otp/<action>", methods=["GET", "POST"])
+def verify_otp(action):
+    if action == "login":
+        pending = session.get("otp_pending")
+        if not pending:
+            return redirect(url_for("login"))
+        if request.method == "POST":
+            code = request.form.get("code", "").strip()
+            if time.time() > pending.get("otp_expires", 0):
+                session.pop("otp_pending", None)
+                flash("That verification code has expired. Please sign in again.")
+                return redirect(url_for("login"))
+            if pending.get("otp_attempts", 0) >= OTP_MAX_ATTEMPTS:
+                session.pop("otp_pending", None)
+                flash("Too many verification attempts. Please sign in again.")
+                return redirect(url_for("login"))
+            pending["otp_attempts"] = pending.get("otp_attempts", 0) + 1
+            session["otp_pending"] = pending
+            if not (len(code) == 6 and code.isdigit() and hmac.compare_digest(otp_hash(code), pending["otp_hash"])):
+                flash("Invalid verification code.")
+            else:
+                session.clear()
+                session.update(username=pending["username"], role=pending["role"], user_id=pending["user_id"])
+                return redirect(url_for("dashboard"))
+        masked_email = pending["email"][:2] + "***" + pending["email"][pending["email"].find("@"):]
+        body = """<section class="card auth"><h1>Check your email.</h1><p class="muted">Enter the 6-digit verification code sent to {{ email }}.</p><form method="post"><div class="form-row"><label>Verification code</label><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></div><button>Verify and sign in</button></form><form method="post" action="{{ url_for('resend_otp') }}"><button class="soft" type="submit">Resend code</button></form><p><a href="{{ url_for('login') }}">Start over</a></p></section>"""
+        return page("Verify sign in", body, email=masked_email)
+
+    session_key = {"register": "pending_user", "reset": "pending_reset"}.get(action)
+    if not session_key:
+        flash("Invalid verification step.")
+        return redirect(url_for("login"))
+
+    pending = session.get(session_key)
+    if not pending:
+        flash("Your verification session has expired. Please try again.")
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        code = request.form.get("code", "").strip()
+        if time.time() > pending.get("otp_expires", 0):
+            session.pop(session_key, None)
+            session.pop("otp_pending", None)
+            flash("That verification code has expired. Please try again.")
+            return redirect(url_for("login"))
+        if pending.get("otp_attempts", 0) >= OTP_MAX_ATTEMPTS:
+            session.pop(session_key, None)
+            session.pop("otp_pending", None)
+            flash("Too many verification attempts. Please try again.")
+            return redirect(url_for("login"))
+        pending["otp_attempts"] = pending.get("otp_attempts", 0) + 1
+        session[session_key] = pending
+        if not (len(code) == 6 and code.isdigit() and hmac.compare_digest(otp_hash(code), pending["otp_hash"])):
+            flash("Invalid verification code.")
+        else:
+            session.pop(session_key, None)
+            session.pop("otp_pending", None)
+            if action == "register":
+                success, message = AuthController().register_user(pending["username"], pending["email"], pending["password"], pending["role"])
+                flash(message)
+                if success:
+                    return redirect(url_for("login"))
+                return redirect(url_for("register"))
+            if action == "reset":
+                success, message = AuthController().submit_password_reset_request(pending["username"], pending["email"], pending["new_password"])
+                flash(message)
+                return redirect(url_for("login"))
+    masked_email = pending["email"][:2] + "***" + pending["email"][pending["email"].find("@"):]
+    body = """<section class="card auth"><h1>Check your email.</h1><p class="muted">Enter the 6-digit code sent to {{ email }} to finish {{ action }}.</p><form method="post"><div class="form-row"><label>Verification code</label><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></div><button>Verify and continue</button></form><form method="post" action="{{ url_for('resend_otp', action=action) }}"><button class="soft" type="submit">Resend code</button></form><p><a href="{{ url_for('login') }}">Start over</a></p></section>"""
+    return page("Verify account", body, email=masked_email, action=action)
+
+
+@app.post("/resend-otp")
+@app.post("/resend-otp/<action>")
+def resend_otp(action="login"):
+    if action == "login":
+        pending = session.get("otp_pending")
+        target = "otp_pending"
+        redirect_target = url_for("verify_otp")
+    else:
+        session_key = {"register": "pending_user", "reset": "pending_reset"}.get(action)
+        if not session_key:
+            flash("Invalid verification step.")
+            return redirect(url_for("login"))
+        pending = session.get(session_key)
+        target = session_key
+        redirect_target = url_for("verify_otp", action=action)
+    if not pending:
+        return redirect(url_for("login"))
+    remaining = int(pending.get("otp_last_sent", 0) + OTP_RESEND_SECONDS - time.time())
+    if remaining > 0:
+        flash(f"Please wait {remaining} seconds before requesting another code.")
+        return redirect(redirect_target)
+    try:
+        issue_otp(pending)
+        session[target] = pending
+    except (RuntimeError, OSError, ValueError) as exc:
+        logger.error("Unable to resend OTP: %s", exc)
+        flash("Unable to send a new verification code right now.")
+    else:
+        flash("A new verification code has been sent.")
+    return redirect(redirect_target)
 
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
         form = request.form
-        success, message = AuthController().register_user(form["username"].strip(), form["email"].strip(), form["password"], form["role"])
-        flash(message)
-        if success:
-            return redirect(url_for("login"))
-    body = """<section class="card auth"><h1>Create account.</h1><form method="post"><div class="form-row"><label>Username</label><input name="username" required></div><div class="form-row"><label>Email</label><input name="email" type="email" required></div><div class="form-row"><label>Password</label><input name="password" type="password" required></div><div class="form-row"><label>Account type</label><select name="role"><option>user</option><option>admin</option></select></div><button>Register</button></form><p><a href="/">Back to sign in</a></p></section>"""
+        username = form.get("username", "").strip()
+        email = form.get("email", "").strip()
+        password = form.get("password", "")
+        role = form.get("role", "user").strip().lower()
+        if not username or not email or not password:
+            flash("All registration fields are required.")
+            return redirect(url_for("register"))
+        pending = {"username": username, "email": email, "password": password, "role": role}
+        try:
+            issue_otp(pending)
+            session["pending_user"] = session["otp_pending"]
+            flash("We sent a 6-digit code to your email. Please verify.")
+            return redirect(url_for("verify_otp", action="register"))
+        except (RuntimeError, OSError, ValueError) as exc:
+            logger.error("Unable to create registration OTP: %s", exc)
+            flash("Failed to send the verification code. Please try again.")
+            return redirect(url_for("register"))
+    body = """<section class="card auth"><h1>Create account.</h1><form method="post"><div class="form-row"><label>Username</label><input name="username" required></div><div class="form-row"><label>Email</label><input name="email" type="email" required></div><div class="form-row"><label>Password</label><input name="password" type="password" required></div><div class="form-row"><label>Account type</label><select name="role"><option>user</option><option>admin</option></select></div><button>Send verification code</button></form><p><a href="/">Back to sign in</a></p></section>"""
     return page("Register", body)
+
+
+@app.route("/reset-request", methods=["GET", "POST"])
+def reset_request():
+    if request.method == "POST":
+        form = request.form
+        username = form.get("username", "").strip()
+        email = form.get("email", "").strip()
+        new_password = form.get("new_password", "")
+        confirm_password = form.get("confirm_password", "")
+        if not username or not email or not new_password or not confirm_password:
+            flash("All reset fields are required.")
+            return redirect(url_for("reset_request"))
+        if new_password != confirm_password:
+            flash("New passwords do not match.")
+            return redirect(url_for("reset_request"))
+        pending = {"username": username, "email": email, "new_password": new_password}
+        try:
+            issue_otp(pending)
+            session["pending_reset"] = session["otp_pending"]
+            flash("We sent a 6-digit verification code to your email.")
+            return redirect(url_for("verify_otp", action="reset"))
+        except (RuntimeError, OSError, ValueError) as exc:
+            logger.error("Unable to create password reset OTP: %s", exc)
+            flash("Failed to send the reset verification code. Please try again.")
+            return redirect(url_for("reset_request"))
+    body = """<section class="card auth"><h1>Reset password.</h1><form method="post"><div class="form-row"><label>Username</label><input name="username" required></div><div class="form-row"><label>Email</label><input name="email" type="email" required></div><div class="form-row"><label>New password</label><input name="new_password" type="password" required></div><div class="form-row"><label>Confirm password</label><input name="confirm_password" type="password" required></div><button>Send verification code</button></form><p><a href="/">Back to sign in</a></p></section>"""
+    return page("Reset password", body)
 
 
 @app.get("/dashboard")
@@ -86,8 +297,8 @@ def admin_dashboard():
     inventory = tracker.fetch_all_inventory()
     body = """
     <h1>Admin inventory</h1><p class="muted">Manage stock, loans, reservations, and accounts from one place.</p>
-    <div class="grid"><div class="card"><span class="muted">Inventory items</span><div class="metric">{{ inventory|length }}</div></div><div class="card"><span class="muted">Units available</span><div class="metric">{{ inventory|sum(attribute=3) }}</div></div><div class="card"><span class="muted">Total asset value</span><div class="metric">₱{{ '%.2f'|format(total) }}</div></div>
-    <section class="card wide"><div class="section-title"><h2>Inventory</h2><a class="button soft" href="{{ url_for('export_csv') }}">Export CSV</a></div><form method="post" action="{{ url_for('add_inventory') }}" class="form-grid"><div><label>Item name</label><input name="item_name" required></div><div><label>Category</label><input name="category" required></div><div><label>Quantity</label><input name="quantity" type="number" min="0" required></div><div><label>Unit price</label><input name="unit_price" type="number" min="0" step=".01" required></div><button>Add item</button></form><table><tr><th>Item</th><th>Category</th><th>Qty</th><th>Status</th><th>Price</th><th>Actions</th></tr>{% for item in inventory %}<tr><td>{{ item[1] }}</td><td>{{ item[2] }}</td><td>{{ item[3] }}</td><td><span class="pill">{{ item[5] if item[5] == 'On Hold' else ('In stock' if item[3] else 'Out of stock') }}</span></td><td>₱{{ '%.2f'|format(item[4]) }}</td><td><form method="post" action="/inventory/{{ item[0] }}/hold" class="inline"><button class="soft">{{ 'Release' if item[5] == 'On Hold' else 'Hold' }}</button></form><a class="button soft" href="/inventory/{{ item[0] }}/edit">Edit</a><form method="post" action="/inventory/{{ item[0] }}/delete" class="inline"><button class="danger">Delete</button></form></td></tr>{% else %}<tr><td colspan="6">No inventory has been added yet.</td></tr>{% endfor %}</table></section>
+    <div class="grid"><div class="card"><span class="muted">Inventory items</span><div class="metric">{{ inventory|length }}</div></div><div class="card"><span class="muted">Units available</span><div class="metric">{{ inventory|sum(attribute=3) }}</div></div><div class="card"><span class="muted">Total asset value</span><div class="metric">â‚±{{ '%.2f'|format(total) }}</div></div>
+    <section class="card wide"><div class="section-title"><h2>Inventory</h2><a class="button soft" href="{{ url_for('export_csv') }}">Export CSV</a></div><form method="post" action="{{ url_for('add_inventory') }}" class="form-grid"><div><label>Item name</label><input name="item_name" required></div><div><label>Category</label><input name="category" required></div><div><label>Quantity</label><input name="quantity" type="number" min="0" required></div><div><label>Unit price</label><input name="unit_price" type="number" min="0" step=".01" required></div><button>Add item</button></form><table><tr><th>Item</th><th>Category</th><th>Qty</th><th>Status</th><th>Price</th><th>Actions</th></tr>{% for item in inventory %}<tr><td>{{ item[1] }}</td><td>{{ item[2] }}</td><td>{{ item[3] }}</td><td><span class="pill">{{ item[5] if item[5] == 'On Hold' else ('In stock' if item[3] else 'Out of stock') }}</span></td><td>â‚±{{ '%.2f'|format(item[4]) }}</td><td><form method="post" action="/inventory/{{ item[0] }}/hold" class="inline"><button class="soft">{{ 'Release' if item[5] == 'On Hold' else 'Hold' }}</button></form><a class="button soft" href="/inventory/{{ item[0] }}/edit">Edit</a><form method="post" action="/inventory/{{ item[0] }}/delete" class="inline"><button class="danger">Delete</button></form></td></tr>{% else %}<tr><td colspan="6">No inventory has been added yet.</td></tr>{% endfor %}</table></section>
     <section class="card"><h2>Borrower records</h2><table><tr><th>Item</th><th>Student</th><th>Course</th><th>Qty</th><th>Status</th><th>Action</th></tr>{% for row in borrowers %}<tr><td>{{ row[1] }}</td><td>{{ row[2] }}<br>{{ row[3] }}</td><td>{{ row[5] }}</td><td>{{ row[6] }}</td><td>{{ row[7] }}</td><td>{% if row[7] != 'Returned' %}<form method="post" action="/borrowers/{{ row[0] }}/status"><select name="status"><option>Missing</option><option>Returned</option></select><button>Update</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="6">No borrower records.</td></tr>{% endfor %}</table></section>
     <section class="card"><h2>Reservations</h2><table><tr><th>Item</th><th>Student</th><th>Details</th><th>Qty</th><th>Status</th><th>Action</th></tr>{% for row in reservations %}<tr><td>{{ row[1] }}</td><td>{{ row[2] }}<br>{{ row[3] }}</td><td>{{ row[7] }} {{ row[8] }}<br>{{ row[5] }}</td><td>{{ row[6] }}</td><td>{{ row[9] }}</td><td>{% if row[9] in ['Pending','On Hold'] %}<form method="post" action="/reservations/{{ row[0] }}/status"><select name="status"><option>Approved</option><option>On Hold</option><option>Rejected</option></select><button>Review</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="6">No reservations.</td></tr>{% endfor %}</table></section>
     <section class="card"><h2>Account password management</h2><table><tr><th>Username</th><th>Email</th><th>Role</th><th>New password</th></tr>{% for account in accounts %}<tr><td>{{ account[0] }}</td><td>{{ account[1] }}</td><td>{{ account[2] }}</td><td><form method="post" action="/accounts/{{ account[0] }}/password" class="small-form"><input name="password" type="password" placeholder="New password" required><button>Change</button></form></td></tr>{% endfor %}</table></section></div>"""
@@ -95,10 +306,20 @@ def admin_dashboard():
 
 
 def user_dashboard():
-    inventory = TrackerController().fetch_all_inventory()
+    tracker = TrackerController()
+    inventory = tracker.fetch_all_inventory()
     body = """
     <h1>Borrow equipment</h1><p class="muted">Select an item, enter borrower details, then borrow it or request a reservation.</p><section class="card"><h2>Available inventory</h2><table><tr><th>Item</th><th>Category</th><th>Available</th><th>Status</th></tr>{% for item in inventory %}<tr><td>{{ item[1] }}</td><td>{{ item[2] }}</td><td>{{ item[3] }}</td><td><span class="pill">{{ item[5] if item[5] == 'On Hold' else ('Available' if item[3] else 'Out of stock') }}</span></td></tr>{% endfor %}</table></section><section class="card"><h2>Borrow or reserve</h2><form method="post" action="/borrow"><div class="form-grid"><div><label>Item</label><select name="item_id" required>{% for item in inventory %}<option value="{{ item[0] }}">{{ item[1] }} ({{ item[3] }} available)</option>{% endfor %}</select></div><div><label>Student name</label><input name="student_name" required></div><div><label>Student ID</label><input name="student_id" required></div><div><label>Section</label><input name="section" required></div><div><label>Course</label><input name="course" required></div><div><label>Quantity</label><input name="quantity" type="number" min="1" value="1" required></div><div><label>Loan status</label><select name="status"><option>Borrowed</option><option>Missing</option></select></div><div class="actions"><button>Borrow selected item</button></div></div></form><hr><form method="post" action="/reserve"><div class="form-grid"><div><label>Item</label><select name="item_id" required>{% for item in inventory %}<option value="{{ item[0] }}">{{ item[1] }}</option>{% endfor %}</select></div><div><label>Student name</label><input name="student_name" required></div><div><label>Student ID</label><input name="student_id" required></div><div><label>Section</label><input name="section" required></div><div><label>Course</label><input name="course" required></div><div><label>Reservation date</label><input name="reservation_date" type="date" required></div><div><label>Reservation time</label><input name="reservation_time" type="time" required></div><div><label>Quantity</label><input name="quantity" type="number" min="1" value="1" required></div><div class="actions"><button>Request reservation</button></div></div></form></section>"""
-    return page("User dashboard", body, inventory=inventory)
+    body += """
+    <section class="card"><h2>Borrowing history</h2><table><tr><th>Item</th><th>Student</th><th>Course</th><th>Qty</th><th>Status</th><th>Borrowed</th><th>Returned</th></tr>{% for row in borrow_history %}<tr><td>{{ row[1] }}</td><td>{{ row[2] }}<br>{{ row[3] }}</td><td>{{ row[5] }}</td><td>{{ row[6] }}</td><td>{{ row[7] }}</td><td>{{ row[8] or '-' }}</td><td>{{ row[9] or '-' }}</td></tr>{% else %}<tr><td colspan="7">No borrowing history yet.</td></tr>{% endfor %}</table></section>
+    <section class="card"><h2>Reservation history</h2><table><tr><th>Item</th><th>Student</th><th>Course</th><th>Qty</th><th>Date</th><th>Time</th><th>Status</th></tr>{% for row in reservation_history %}<tr><td>{{ row[1] }}</td><td>{{ row[2] }}<br>{{ row[3] }}</td><td>{{ row[5] }}</td><td>{{ row[6] }}</td><td>{{ row[7] }}</td><td>{{ row[8] }}</td><td>{{ row[9] }}</td></tr>{% else %}<tr><td colspan="7">No reservation history yet.</td></tr>{% endfor %}</table></section>"""
+    return page(
+        "User dashboard",
+        body,
+        inventory=inventory,
+        borrow_history=tracker.fetch_user_borrow_records(session["user_id"]),
+        reservation_history=tracker.fetch_user_reservations(session["user_id"]),
+    )
 
 
 def form_int(name):
